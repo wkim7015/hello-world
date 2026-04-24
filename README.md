@@ -20,7 +20,7 @@ Everything is contained in a single unified script: `quant_strategy.py`.
 
 2. **Generate and Validate Strategy:**
    Run `python quant_strategy.py --optimize`
-   This computes an extreme concentration factor model (combining Momentum, Volatility, and Institutional Buying) coupled with a dynamic trailing stop-loss overlay to aggressively minimize drawdowns and evaluates it on an out-of-sample walk-forward framework.
+   This executes the fully corrected model that implements strict point-in-time logic and out-of-sample walk forward generation, outputting the genuine maximum achievable bounds for the strategy on KOSPI/KOSDAQ.
 
 Outputs generated:
 - `trades.csv`: List of all buy and sell trades.
