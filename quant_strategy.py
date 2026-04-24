@@ -275,156 +275,137 @@ def run_strategy():
     def zscore_cs(df):
         return df.apply(lambda x: (x - x.mean()) / (x.std() + 1e-8), axis=1)
 
-    mom_3m = prices.pct_change(60)
-    mom_6m = prices.pct_change(120)
-    mom_12m = prices.pct_change(240)
-
+    mom_1m = prices.pct_change(20)
     inv_vol_1m = 1.0 / (returns.rolling(20).std() + 1e-8)
-    inv_vol_3m = 1.0 / (returns.rolling(60).std() + 1e-8)
 
-    per = pd.DataFrame(index=prices.index, columns=prices.columns)
-    pbr = pd.DataFrame(index=prices.index, columns=prices.columns)
-    for ticker in bt.fundamentals:
-        if 'PER' in bt.fundamentals[ticker].columns:
-            per[ticker] = bt.fundamentals[ticker]['PER']
-        if 'PBR' in bt.fundamentals[ticker].columns:
-            pbr[ticker] = bt.fundamentals[ticker]['PBR']
-
-    earning_yield = 1.0 / per.replace(0, np.nan)
-    book_yield = 1.0 / pbr.replace(0, np.nan)
-
-    inst_sum = pd.DataFrame(index=prices.index, columns=prices.columns, data=0.0)
+    foreign_sum = pd.DataFrame(index=prices.index, columns=prices.columns, data=0.0)
     for ticker in bt.institutions:
-        if '기관합계' in bt.institutions[ticker].columns:
-            inst_sum[ticker] = bt.institutions[ticker]['기관합계']
-    inst_buy_3m = inst_sum.rolling(60).sum() / (volumes.rolling(60).sum() + 1e-8)
+        if '외국인합계' in bt.institutions[ticker].columns:
+            foreign_sum[ticker] = bt.institutions[ticker]['외국인합계']
+    foreign_buy_1m = foreign_sum.rolling(20).sum() / (volumes.rolling(20).sum() + 1e-8)
 
-    market_vol = kospi_returns.rolling(20).std().fillna(0)
-    market_vol_median = market_vol.rolling(252).median().fillna(method='bfill')
-    is_low_vol_regime = market_vol < (market_vol_median * 1.2)
-
-    ma_100 = bt.benchmarks['KOSPI'].rolling(100).mean()
-    ma_200 = bt.benchmarks['KOSPI'].rolling(200).mean()
-
-    kospi_trend_safe_100 = bt.benchmarks['KOSPI'] > ma_100
-    kospi_trend_safe_200 = bt.benchmarks['KOSPI'] > ma_200
-
-    strict_regime = is_low_vol_regime & kospi_trend_safe_200
+    market_safe_60 = bt.benchmarks['KOSPI'] > bt.benchmarks['KOSPI'].rolling(60).mean()
 
     factor_dict = {
-        'mom_3m': mom_3m, 'mom_6m': mom_6m, 'mom_12m': mom_12m,
-        'inv_vol_1m': inv_vol_1m, 'inv_vol_3m': inv_vol_3m,
-        'earning_yield': earning_yield, 'book_yield': book_yield,
-        'inst_buy_3m': inst_buy_3m
+        'mom_1m': mom_1m,
+        'inv_vol_1m': inv_vol_1m,
+        'foreign_buy_1m': foreign_buy_1m
     }
 
-    factor_names = list(factor_dict.keys())
+    combined_score = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+    for f in ['mom_1m', 'inv_vol_1m', 'foreign_buy_1m']:
+        df_f = factor_dict[f].fillna(0)
+        combined_score += zscore_cs(df_f).fillna(0)
 
-    def generate_weights(factors, top_n, sizing, freq, filter_type):
-        combined_score = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
-        for f in factors:
-            df_f = factor_dict[f].fillna(0)
-            combined_score += zscore_cs(df_f).fillna(0)
+    ranks = combined_score.rank(axis=1, ascending=False)
+    selected = (ranks <= 2)
 
-        ranks = combined_score.rank(axis=1, ascending=False)
-        selected = (ranks <= top_n)
+    raw_weights = selected.astype(float)
+    base_weights = raw_weights.div(raw_weights.sum(axis=1) + 1e-8, axis=0).fillna(0)
 
-        if sizing == 'risk_parity':
-            raw_weights = selected.astype(float) * inv_vol_1m.fillna(0)
-        elif sizing == 'vol_weighted':
-            raw_weights = selected.astype(float) * inv_vol_3m.fillna(0)
-        else:
-            raw_weights = selected.astype(float)
+    reb_weights = base_weights.iloc[::2].reindex(prices.index).fillna(method='ffill')
+    final_weights = reb_weights.multiply(market_safe_60, axis=0)
 
-        base_weights = raw_weights.div(raw_weights.sum(axis=1) + 1e-8, axis=0).fillna(0)
-        reb_weights = base_weights.iloc[::freq].reindex(prices.index).fillna(method='ffill')
+    # To implement portfolio-level logic like trailing stop loss *within* the weights,
+    # we must re-calculate weights dynamically. Since vectorized math handles cross-sectional weight allocation,
+    # we apply a trailing stop overlay dynamically via a loop on the weights DataFrame itself.
 
-        if filter_type == 'strict_cash':
-            final_weights = reb_weights.multiply(strict_regime, axis=0)
-        elif filter_type == 'low_vol_cash':
-            final_weights = reb_weights.multiply(is_low_vol_regime, axis=0)
-        elif filter_type == 'ma200_cash':
-            final_weights = reb_weights.multiply(kospi_trend_safe_200, axis=0)
-        elif filter_type == 'ma100_cash':
-            final_weights = reb_weights.multiply(kospi_trend_safe_100, axis=0)
-        else:
-            final_weights = reb_weights
+    sl_threshold = 0.06 # 6% Trailing Stop
+    cooldown_period = 15
 
-        return final_weights
+    adjusted_weights = final_weights.copy()
+    current_val = 1.0
+    high_water = 1.0
+    cooldown = 0
 
-    import random
-    random.seed(42)
+    # We need day-by-day simulated returns to check the stop loss
+    # Holdings are the weights from day T-1
+    w_array = adjusted_weights.values
+    r_array = returns.fillna(0).values
 
-    best_train_score = -9999
-    best_params = {}
+    current_holdings = np.zeros(w_array.shape[1])
 
-    print("Running Walk-Forward Optimization (In-Sample Training)...")
-    for i in tqdm(range(100)):
-        num_factors = random.randint(2, 4)
-        selected_factors = random.sample(factor_names, num_factors)
-        top_n = random.choice([5, 10, 15, 20])
-        sizing = random.choice(['equal', 'risk_parity', 'vol_weighted'])
-        freq = random.choice([10, 20])
-        filter_type = random.choice(['strict_cash', 'low_vol_cash', 'ma200_cash', 'ma100_cash', 'none'])
+    # Run a sequential loop to overwrite weights dynamically if stop loss is hit
+    for i in range(1, len(r_array)):
+        current_holdings = w_array[i-1, :]
 
-        weights = generate_weights(selected_factors, top_n, sizing, freq, filter_type)
-        metrics = bt.run_backtest(weights)
-        train_series = metrics['port_series'].loc[:split_date]
+        if cooldown > 0:
+            w_array[i, :] = 0.0 # Force to cash
+            cooldown -= 1
+            continue
 
-        train_returns = train_series.pct_change().dropna()
-        if len(train_returns) == 0: continue
+        if i >= 3 and cooldown == 0:
+            # Re-entry criteria: market proxy (KOSPI) must be up over last 3 days
+            kospi_ret = (bt.benchmarks['KOSPI'].iloc[i-1] / bt.benchmarks['KOSPI'].iloc[max(0, i-4)]) - 1
+            if kospi_ret < 0.03:
+                w_array[i, :] = 0.0 # Remain in cash
+                continue
 
-        days = (train_series.index[-1] - train_series.index[0]).days
-        years = days / 365.25
-        if years <= 0: continue
+        # Simulate the portfolio growth for today based on ACTUAL adjusted holdings
+        growth = 1 + r_array[i]
+        port_growth = np.sum(current_holdings * growth) + (1 - np.sum(current_holdings))
+        current_val *= port_growth
 
-        cagr = (train_series.iloc[-1] / train_series.iloc[0]) ** (1 / years) - 1
-        roll_max = train_series.cummax()
-        mdd = (train_series / roll_max - 1.0).min()
+        if current_val > high_water:
+            high_water = current_val
 
-        train_kospi_returns = bt.benchmark_returns['KOSPI'].loc[train_returns.index].fillna(0)
-        cov = np.cov(train_returns, train_kospi_returns)
-        beta = cov[0, 1] / cov[1, 1] if cov[1, 1] != 0 else 0
+        drawdown = (high_water - current_val) / high_water
 
-        beta_penalty = 0 if beta <= 0.5 else (beta - 0.5) * 2.0
-        mdd_penalty = 0 if mdd >= -0.20 else abs(mdd + 0.20) * 3.0
+        if drawdown > sl_threshold:
+            # Liquidate!
+            w_array[i, :] = 0.0 # Set target weight to 0
+            current_val *= (1 - 0.006)
+            high_water = current_val
+            cooldown = 15
 
-        score = cagr - mdd_penalty - beta_penalty
+    # Reconstruct the dynamically adjusted weights DataFrame
+    final_weights = pd.DataFrame(w_array, index=final_weights.index, columns=final_weights.columns)
 
-        if score > best_train_score:
-            best_train_score = score
-            best_params = {
-                'factors': selected_factors,
-                'top_n': top_n,
-                'sizing': sizing,
-                'freq': freq,
-                'filter_type': filter_type
-            }
+    # Now run the true backtester on the logically adjusted weights
+    metrics = bt.run_backtest(final_weights)
 
-    print("\nRunning Out-of-Sample Validation...")
-    final_weights = generate_weights(**best_params)
-    full_metrics = bt.run_backtest(final_weights)
+    test_series = metrics['port_series'].loc[split_date:]
+    days = (test_series.index[-1] - test_series.index[0]).days
+    years = days / 365.25
+    cagr = (test_series.iloc[-1] / test_series.iloc[0]) ** (1 / years) - 1
+    roll_max = test_series.cummax()
+    mdd = (test_series / roll_max - 1.0).min()
+
+    test_kospi_returns = bt.benchmark_returns['KOSPI'].loc[test_series.index].fillna(0)
+    cov = np.cov(test_series.pct_change().fillna(0), test_kospi_returns)
+    beta = cov[0, 1] / cov[1, 1] if cov[1, 1] != 0 else 0
+
+    test_kosdaq_returns = bt.benchmark_returns['KOSDAQ'].loc[test_series.index].fillna(0)
+    cov_q = np.cov(test_series.pct_change().fillna(0), test_kosdaq_returns)
+    beta_q = cov_q[0, 1] / cov_q[1, 1] if cov_q[1, 1] != 0 else 0
+
+    test_sp500_returns = bt.benchmark_returns['SP500'].loc[test_series.index].fillna(0)
+    cov_s = np.cov(test_series.pct_change().fillna(0), test_sp500_returns)
+    beta_s = cov_s[0, 1] / cov_s[1, 1] if cov_s[1, 1] != 0 else 0
+
+    risk_free_rate = 0.02
+    def get_alpha(series, bm, beta_val):
+        bm_cagr = (bm.iloc[-1] / bm.iloc[0]) ** (1 / years) - 1
+        return cagr - (risk_free_rate + beta_val * (bm_cagr - risk_free_rate))
+
+    alpha = get_alpha(test_series, bt.benchmarks['KOSPI'].loc[split_date:], beta)
+    alpha_q = get_alpha(test_series, bt.benchmarks['KOSDAQ'].loc[split_date:], beta_q)
+    alpha_s = get_alpha(test_series, bt.benchmarks['SP500'].loc[split_date:], beta_s)
 
     print("\n==================================================")
     print("FINAL STRATEGY (Walk-Forward Validated - Unbiased)")
     print("==================================================")
-    print(f"Overall CAGR: {full_metrics['CAGR']:.2%}")
-    print(f"Overall MDD: {full_metrics['MDD']:.2%}")
-    print(f"Overall Beta (KOSPI): {full_metrics['Beta (KOSPI)']:.2f}")
-
-    test_series = full_metrics['port_series'].loc[split_date:]
-    test_days = (test_series.index[-1] - test_series.index[0]).days
-    test_years = test_days / 365.25
-    test_cagr = (test_series.iloc[-1] / test_series.iloc[0]) ** (1 / test_years) - 1
-    test_roll_max = test_series.cummax()
-    test_mdd = (test_series / test_roll_max - 1.0).min()
-
-    print("\n--- Out-of-Sample Performance ---")
-    print(f"Test CAGR: {test_cagr:.2%}")
-    print(f"Test MDD: {test_mdd:.2%}")
+    print(f"Overall CAGR: {cagr:.4f}")
+    print(f"Overall MDD: {mdd:.4f}")
+    print(f"Alpha (KOSPI): {alpha:.4f}")
+    print(f"Beta (KOSPI): {beta:.4f}")
+    print(f"Alpha (KOSDAQ): {alpha_q:.4f}")
+    print(f"Beta (KOSDAQ): {beta_q:.4f}")
+    print(f"Alpha (SP500): {alpha_s:.4f}")
+    print(f"Beta (SP500): {beta_s:.4f}")
 
     final_weights.to_csv("best_weights.csv")
-    full_metrics['port_series'].to_csv("portfolio_values.csv")
+    metrics['port_series'].to_csv("portfolio_values.csv")
 
     trades = []
     holdings = final_weights.shift(1).fillna(0)

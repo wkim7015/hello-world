@@ -20,7 +20,7 @@ Everything is contained in a single unified script: `quant_strategy.py`.
 
 2. **Generate and Validate Strategy:**
    Run `python quant_strategy.py --optimize`
-   This generates 100 permutations of factor combinations (Momentum, Value, Volatility, Institutional Buying) and market filters on the training set, and validates the best strategy on the out-of-sample set.
+   This computes an extreme concentration factor model (combining Momentum, Volatility, and Institutional Buying) coupled with a dynamic trailing stop-loss overlay to aggressively minimize drawdowns and evaluates it on an out-of-sample walk-forward framework.
 
 Outputs generated:
 - `trades.csv`: List of all buy and sell trades.
