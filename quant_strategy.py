@@ -25,10 +25,10 @@ KRX_LOGIN_PW = os.environ.get("KRX_PW", "")
 _krx_session = requests.Session()
 
 def _session_post_read(self, **params):
-    return _krx_session.post(self.url, headers=self.headers, data=params, verify=False)
+    return _krx_session.post(self.url, headers=self.headers, data=params, verify=True)
 
 def _session_get_read(self, **params):
-    return _krx_session.get(self.url, headers=self.headers, params=params, verify=False)
+    return _krx_session.get(self.url, headers=self.headers, params=params, verify=True)
 
 webio.Post.read = _session_post_read
 webio.Get.read = _session_get_read
@@ -38,11 +38,11 @@ def login_krx(login_id, login_pw):
     J = "https://data.krx.co.kr/contents/MDC/COMS/client/view/login.jsp?site=mdc"
     U = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001D1.cmd"
     A = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    _krx_session.get(P, headers={"User-Agent": A}, timeout=15, verify=False)
-    _krx_session.get(J, headers={"User-Agent": A, "Referer": P}, timeout=15, verify=False)
+    _krx_session.get(P, headers={"User-Agent": A}, timeout=15, verify=True)
+    _krx_session.get(J, headers={"User-Agent": A, "Referer": P}, timeout=15, verify=True)
     r = _krx_session.post(U, data={"mbrNm": "", "telNo": "", "di": "", "certType": "",
                                     "mbrId": login_id, "pw": login_pw},
-                          headers={"User-Agent": A, "Referer": P}, timeout=15, verify=False)
+                          headers={"User-Agent": A, "Referer": P}, timeout=15, verify=True)
     return r.json().get("_error_code", "") == "CD001"
 
 # ==============================================================================
@@ -429,22 +429,55 @@ def run_strategy():
         sig = df.std(axis=1) + 1e-8
         return df.sub(mu, axis=0).div(sig, axis=0)
 
-    print("Calculating momentum signals...")
-    mom = zscore_cs(factors['mom_12_1'][0].fillna(0))
+    print("Calculating composite signals...")
+    w_mom = 3.0
+    w_vol = 0.1604
+    w_foreign = 2.0
+    w_value = 0.3025
+    N_STOCKS = 5
 
-    ranks = mom.rank(axis=1, ascending=False)
-    selected = (ranks <= 2).astype(float)
-    row_sum = selected.sum(axis=1).replace(0, np.nan)
-    base_weights = selected.div(row_sum, axis=0).fillna(0)
+    combined_score = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+    combined_score += w_mom * zscore_cs(factors['mom_12_1'][0].fillna(0))
+    combined_score += w_vol * zscore_cs(factors['inv_vol'][0].fillna(0))
+    combined_score += w_foreign * zscore_cs(factors['foreign_buy'][0].fillna(0))
+    combined_score += w_value * zscore_cs(factors['value'][0].fillna(0))
+
+    ranks     = combined_score.rank(axis=1, ascending=False)
+    selected  = (ranks <= N_STOCKS).astype(float)
+
+    print("Applying inverse volatility sizing...")
+    inv_vol_panel = (1.0 / (returns.rolling(21).std() + 1e-8))
+    inv_vol_selected = inv_vol_panel.where(selected > 0, 0.0)
+    row_sum = inv_vol_selected.sum(axis=1).replace(0, np.nan)
+    base_weights = inv_vol_selected.div(row_sum, axis=0).fillna(0)
 
     monthly_dates = base_weights.resample('ME').last().index
     monthly_weights = base_weights.reindex(monthly_dates)
     base_weights = monthly_weights.reindex(base_weights.index).ffill().fillna(0)
 
-    print("Applying KOSDAQ 100-day MA filter...")
+    print("Applying KOSDAQ 100-day Soft MA filter...")
     kosdaq_ma = bt.benchmarks['KOSDAQ'].rolling(100).mean()
-    market_safe = (bt.benchmarks['KOSDAQ'] > kosdaq_ma).astype(float).rolling(2).min().fillna(0)
-    final_weights = base_weights.multiply(market_safe, axis=0)
+    market_safe = (bt.benchmarks['KOSDAQ'] > kosdaq_ma).astype(float).rolling(5).min().fillna(0)
+    safe_weights = base_weights.multiply(market_safe.replace(0, 0.7), axis=0)
+
+    print("Applying volatility targeting...")
+    vol_weights, vol_scalar = volatility_target(
+        returns, safe_weights, target_vol=0.70, window=21)
+
+    # Strictly unleveraged.
+    vol_weights = vol_weights.clip(lower=0.0, upper=1.0)
+
+    print("Applying trailing stop-loss...")
+    final_weights = apply_trailing_stop(
+        prices_df      = prices,
+        weights_df     = vol_weights,
+        returns_df     = returns,
+        benchmarks     = bt.benchmarks,
+        sl_threshold   = 0.16,
+        cooldown_period = 20,
+        reentry_momentum_days      = 3,
+        reentry_momentum_threshold = 0.01
+    )
 
     print("Running backtest...")
     metrics = bt.run_backtest(final_weights)
@@ -510,7 +543,8 @@ def run_strategy():
                 })
 
     pd.DataFrame(trades).to_csv("trades.csv", index=False)
-    print("Outputs saved: best_weights.csv, portfolio_values.csv, trades.csv")
+    vol_scalar.to_csv("vol_scalar.csv")
+    print("Outputs saved: best_weights.csv, portfolio_values.csv, trades.csv, vol_scalar.csv")
     return metrics
 
 if __name__ == "__main__":
